@@ -1,12 +1,17 @@
 #!/bin/bash
 
+# This script allows you to convert the content of this folder into a markdown file `files.md` which can then be used with any llm.
+
 # Default excluded extensions grouped by type
 EXCLUDED_IMAGES=("jpg" "jpeg" "png" "gif" "bmp" "tiff" "webp" "svg" "ico" "raw" "cr2" "nef" "arw" "heic")
 EXCLUDED_VIDEOS=("mp4" "avi" "mkv" "mov" "wmv" "flv" "webm" "m4v" "mpeg" "mpg" "3gp")
-EXCLUDED_DEV=("git" "pyc" "pyo" "pyd" "DS_Store" "swp" "swo" "class" "o" "so" "dll" "exe")
+EXCLUDED_DEV=("git" "pyc" "pyo" "pyd" "DS_Store" "swp" "swo" "class" "o" "so" "dll" "exe" "json" "pkl" "parquet")
 
 # Combine all default exclusions
 EXCLUDED_EXTENSIONS=("${EXCLUDED_DEV[@]}" "${EXCLUDED_IMAGES[@]}" "${EXCLUDED_VIDEOS[@]}")
+
+# Excluded directories
+EXCLUDED_DIRS=(".git" "node_modules" ".vscode" ".next")
 
 show_help() {
     echo "Usage: flattenmd [options]"
@@ -22,7 +27,7 @@ show_help() {
     echo "  --list-excluded       Show currently excluded extensions"
     echo
     echo "By default excludes:"
-    echo "- .git directories and contents"
+    echo "- Directories: ${EXCLUDED_DIRS[*]}"
     echo "- .env files"
     echo "- Image files (${EXCLUDED_IMAGES[*]})"
     echo "- Video files (${EXCLUDED_VIDEOS[*]})"
@@ -32,24 +37,47 @@ show_help() {
 
 # Build the find command's exclude patterns
 build_exclude_pattern() {
-    local pattern="-not -path '*/.git/*' -not -name 'files.md' -not -name 'flattenmd'"
+    local pattern=""
+    
+    # Exclude directories
+    for dir in "${EXCLUDED_DIRS[@]}"; do
+        pattern="$pattern -not -path '*/$dir/*'"
+    done
+    
+    # Exclude specific files
+    pattern="$pattern -not -name 'files.md' -not -name 'flattenmd'"
+    
+    # Exclude extensions
     for ext in "${EXCLUDED_EXTENSIONS[@]}"; do
         pattern="$pattern -not -name \"*.$ext\""
     done
+    
     echo "$pattern"
 }
 
 # Function to check if file should be excluded
 is_excluded() {
     local file="$1"
-    if [[ "$file" == ".env" ]] || [[ "$file" == "files.md" ]] || [[ "$file" == *".git"* ]] || [[ "$file" == "flattenmd" ]]; then
+    
+    # Check if file is in excluded directories
+    for dir in "${EXCLUDED_DIRS[@]}"; do
+        if [[ "$file" == *"$dir/"* ]]; then
+            return 0  # True, file should be excluded
+        fi
+    done
+    
+    # Check specific files
+    if [[ "$file" == ".env" ]] || [[ "$file" == "files.md" ]]; then
         return 0  # True, file should be excluded
     fi
+    
+    # Check extensions
     for ext in "${EXCLUDED_EXTENSIONS[@]}"; do
         if [[ "$file" == *".$ext" ]]; then
             return 0  # True, file should be excluded
         fi
     done
+    
     return 1  # False, file should be included
 }
 
@@ -131,6 +159,8 @@ while [[ $# -gt 0 ]]; do
         --list-excluded)
             echo "Currently excluded extensions:"
             printf '%s\n' "${EXCLUDED_EXTENSIONS[@]}" | sort -u
+            echo "Excluded directories:"
+            printf '%s\n' "${EXCLUDED_DIRS[@]}" | sort -u
             exit 0
             ;;
         *)
@@ -141,8 +171,15 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Build the find commands - one for all files, one for included files
-ALL_FILES_CMD="find \"$DIRECTORY\" -type f -not -path '*/.git/*' -printf '%P\n'"
+# Build the find commands with the updated exclusion patterns
+ALL_FILES_CMD="find \"$DIRECTORY\" -type f -not -path '*/.git/*'"
+for dir in "${EXCLUDED_DIRS[@]}"; do
+    if [[ "$dir" != ".git" ]]; then  # Already excluded above
+        ALL_FILES_CMD="$ALL_FILES_CMD -not -path '*/$dir/*'"
+    fi
+done
+ALL_FILES_CMD="$ALL_FILES_CMD -printf '%P\n'"
+
 INCLUDED_FILES_CMD="find \"$DIRECTORY\" -type f $(build_exclude_pattern) -printf '%P\n'"
 
 # Show preview with detailed status for all files
@@ -185,39 +222,44 @@ echo "## Project Structure" >> "$OUTPUT_FILE"
 echo >> "$OUTPUT_FILE"
 echo "\`\`\`" >> "$OUTPUT_FILE"
 
-# Generate tree structure with annotations
-tree -a --dirsfirst --noreport -I '.git' . | while IFS= read -r line; do
+# Generate tree structure but exclude the specified directories
+# Note: tree has built-in directory exclusion with -I but it takes a pattern, not a path
+tree_exclude_pattern=$(IFS="|"; echo "${EXCLUDED_DIRS[*]}")
+tree -a --dirsfirst --noreport -I ".git|$tree_exclude_pattern" . -f | while IFS= read -r line; do
     # Skip the first line (current directory)
     if [[ "$line" == "." ]]; then
         continue
     fi
     
-    # Get the file/directory name from the line
-    name=$(echo "$line" | sed 's/.*[├└]── //')
+    # Get the full path of the file/directory from the line (stripping ./ prefix)
+    raw_name=$(echo "$line" | sed 's/.*[├└]── \.\///' | sed 's/.*[├└]── //')
     
-    # Check if it's files.md and skip if it is
-    if [[ "$name" == "files.md" ]]; then
+    # Get the display name (without path) for the output
+    display_name=$(basename "$raw_name")
+    
+    # Extract the directory structure (indentation)
+    prefix=$(echo "$line" | sed 's/\([├└]── \).*/\1/')
+    
+    # Skip files.md
+    if [[ "$raw_name" == "files.md" ]]; then
         continue
     fi
     
-    # Generate the prefix (tree structure part)
-    prefix=$(echo "$line" | sed 's/\([├└]── \).*/\1/')
-    
-    # Add status annotations
-    if [[ -f "$name" ]]; then
-        if is_excluded "$name"; then
-            echo "$prefix$name *(excluded)*"
-        elif is_empty_file "$name"; then
-            echo "$prefix$name *(empty)*"
+    # Check the actual file/directory status
+    if [[ -f "$raw_name" ]]; then
+        if is_excluded "$raw_name"; then
+            echo "$prefix$display_name *(excluded)*"
+        elif is_empty_file "$raw_name"; then
+            echo "$prefix$display_name *(empty)*"
         else
-            echo "$prefix$name"
+            echo "$prefix$display_name"
         fi
     else
         # It's a directory
-        if [ -z "$(ls -A "$name" 2>/dev/null)" ]; then
-            echo "$prefix$name/ *(empty)*"
+        if [ -z "$(ls -A "$raw_name" 2>/dev/null)" ]; then
+            echo "$prefix$display_name/ *(empty)*"
         else
-            echo "$prefix$name/"
+            echo "$prefix$display_name/"
         fi
     fi
 done >> "$OUTPUT_FILE"
@@ -237,15 +279,14 @@ eval "$INCLUDED_FILES_CMD" | sort | while read -r f; do
             continue
         fi
         
-        # Add filename as header
-        filename=$(basename "$f")
-        ext=$(get_extension "$filename")
+        # Get extension from full path
+        ext=$(get_extension "$f")
         
         if is_empty_file "$f"; then
-            echo -e "#### ${filename} *(empty)*\n" >> "$OUTPUT_FILE"
+            echo -e "#### ${f} *(empty)*\n" >> "$OUTPUT_FILE"
             echo -e "\`\`\`${ext}\n\`\`\`" >> "$OUTPUT_FILE"
         else
-            echo -e "#### ${filename}\n" >> "$OUTPUT_FILE"
+            echo -e "#### ${f}\n" >> "$OUTPUT_FILE"
             echo "\`\`\`$ext" >> "$OUTPUT_FILE"
             cat "$f" >> "$OUTPUT_FILE"
             echo >> "$OUTPUT_FILE"  # Ensure newline before closing fence
